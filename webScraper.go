@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -13,12 +16,35 @@ import (
 
 var writingErrors []error
 var currentAlbum string
+var currentReleaseDate string
 var trackNumber int
 var songTitle string
+var structList []APIResponse
+
+type APIResponse struct {
+	Response Response `json:"response"`
+}
+
+type Response struct {
+	Albums   []Album `json:"albums"`
+	NextPage int     `json:"next_page"` // pointer because it can be null / missing
+}
+
+type Album struct {
+	Name                  string      `json:"name"`
+	URL                   string      `json:"url"`
+	ReleaseDateComponents ReleaseDate `json:"release_date_components"`
+}
+
+type ReleaseDate struct {
+	Year  int `json:"year"`
+	Month int `json:"month"`
+	Day   int `json:"day"`
+}
 
 // save lyrics to local files
 func writeToFile(title string, lyrics string) {
-	directory := "./lyrics/" + currentAlbum
+	directory := "./lyrics/" + currentAlbum + " (" + currentReleaseDate + ")"
 	// create directory if it doesn't exist
 	err := os.MkdirAll(directory, 0777)
 	if err != nil {
@@ -54,9 +80,65 @@ func endScrape() {
 	}
 }
 
+func getJson(url string) APIResponse {
+
+	response, err := http.Get(url)
+	if err != nil {
+		fmt.Printf("error fetching JSON data: %s", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		fmt.Println("recieved not-OK status: ", response.Status)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		fmt.Printf("error reading response body: %v", err)
+	}
+
+	var apiResp APIResponse
+	err = json.Unmarshal(body, &apiResp)
+	if err != nil {
+		fmt.Printf("error unmarshaling JSON: %v", err)
+	}
+
+	return apiResp
+}
+
+// retrieve all album URLs from paginated JSON data
+func getJSONStructs(url string) {
+
+	// separate url into pre and post page components
+	prePageURL, postPageURL, found := strings.Cut(url, "?page=")
+	AmpersandIndex := strings.Index(postPageURL, "&")
+	if !found {
+
+	}
+	postPageURL = postPageURL[AmpersandIndex:]
+
+	//get data
+	isMorePages := true
+	i := 1
+	for isMorePages {
+		JSONurl := prePageURL + "?page=" + fmt.Sprint(i) + postPageURL[AmpersandIndex:]
+		responseStruct := getJson(JSONurl)
+
+		structList = append(structList, responseStruct)
+
+		nextPage := responseStruct.Response.NextPage
+		if nextPage == 0 {
+			isMorePages = false
+		}
+		i++
+	}
+}
+
 func main() {
+	url := "https://genius.com/api/artists/455/albums?page=1&per_page=50&sort=release_date&pageviews=false&text_format=html%2Cmarkdown"
+	getJSONStructs(url)
+
 	numVisited := 0
-	var url string = "https://genius.com/artists/Lil-b/albums"
 	c := colly.NewCollector(
 		colly.AllowedDomains("genius.com"),
 		colly.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:124.0) Gecko/20100101 Firefox/124.0"),
@@ -80,19 +162,6 @@ func main() {
 
 	c.OnResponse(func(r *colly.Response) {
 		fmt.Println("Response received")
-	})
-
-	// scrape discog for album links
-	c.OnHTML("ul.ListSection-desktop__Items-sc-f0fb85c4-8", func(e *colly.HTMLElement) {
-		fmt.Println("ul found")
-		e.ForEach("li", func(i int, ee *colly.HTMLElement) {
-			link, _ := ee.DOM.Find("a[href]").Attr("href")
-			if strings.Contains(link, "https://genius.com/albums/Lil-b") {
-				currentAlbum = ee.DOM.Find("h3").Text()
-				trackNumber = 0
-				ee.Request.Visit(link)
-			}
-		})
 	})
 
 	// scrape album page for song links
@@ -127,6 +196,13 @@ func main() {
 		writeToFile(songTitle, lyricsString)
 	})
 
-	c.Visit(url)
+	for i := 0; i < len(structList); i++ {
+		for j := 0; j < len(structList[i].Response.Albums); j++ {
+			trackNumber = 0
+			currentAlbum = structList[i].Response.Albums[j].Name
+			currentReleaseDate = fmt.Sprintf("%04d-%02d-%02d", structList[i].Response.Albums[j].ReleaseDateComponents.Year, structList[i].Response.Albums[j].ReleaseDateComponents.Month, structList[i].Response.Albums[j].ReleaseDateComponents.Day)
+			c.Visit(structList[i].Response.Albums[j].URL)
+		}
+	}
 	defer endScrape()
 }
